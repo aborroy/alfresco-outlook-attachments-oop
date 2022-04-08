@@ -18,6 +18,7 @@ package org.alfresco.sdk.sample.handler;
 import org.alfresco.core.handler.NodesApi;
 import org.alfresco.core.model.AssociationBody;
 import org.alfresco.core.model.NodeBodyCreate;
+import org.alfresco.core.model.NodeBodyUpdate;
 import org.alfresco.core.model.NodeEntry;
 import org.alfresco.event.sdk.handling.filter.EventFilter;
 import org.alfresco.event.sdk.handling.filter.IsFileFilter;
@@ -42,19 +43,18 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 
 @Component
 public class MailAttachmentExtractorHandler implements OnNodeCreatedEventHandler {
-
-    private static final Logger LOGGER = LoggerFactory.getLogger(MailAttachmentExtractorHandler.class);
 
     // Alfresco Content Model identifiers
     public static final String CM_FOLDER = "cm:folder";
     public static final String CM_CONTENT = "cm:content";
     public static final String IMAP_ATTACHMENT = "imap:attachment";
     public static final String IMAP_ATTACHMENTS_FOLDER = "imap:attachmentsFolder";
-
+    private static final Logger LOGGER = LoggerFactory.getLogger(MailAttachmentExtractorHandler.class);
     @Autowired
     NodesApi nodesApi;
 
@@ -69,12 +69,12 @@ public class MailAttachmentExtractorHandler implements OnNodeCreatedEventHandler
 
             LOGGER.info("Retrieving content from Alfresco node {}", nodeResource.getName());
 
-            InputStream mailFileInputStream = nodesApi.getNodeContent(nodeResource.getId(), true, null, null)
-                    .getBody()
-                    .getInputStream();
+            String createdByUser = nodeResource.getCreatedByUser().getId();
+
+            InputStream mailFileInputStream = nodesApi.getNodeContent(nodeResource.getId(), true, null, null).getBody().getInputStream();
 
             MimeMessage message = new MimeMessage(Session.getDefaultInstance(new Properties(), null), mailFileInputStream);
-            List<String> attachments = createAttachments(nodeResource.getId(), createAttachmentsFolder(nodeResource), message);
+            List<String> attachments = createAttachments(nodeResource.getId(), createAttachmentsFolder(nodeResource, createdByUser), message, createdByUser);
 
             LOGGER.info("Attachments " + attachments + " have been uploaded to Alfresco");
 
@@ -85,38 +85,45 @@ public class MailAttachmentExtractorHandler implements OnNodeCreatedEventHandler
 
     @Override
     public EventFilter getEventFilter() {
-        return IsFileFilter.get()
-                .and(MimeTypeFilter.of("message/rfc822"))
-                .or(MimeTypeFilter.of("application/vnd.ms-outlook"));
+        return IsFileFilter.get().and(MimeTypeFilter.of("message/rfc822")).or(MimeTypeFilter.of("application/vnd.ms-outlook"));
     }
 
-    private String createAttachmentsFolder(NodeResource nodeResource) {
-        final NodeBodyCreate nodeBodyCreate = new NodeBodyCreate().nodeType(CM_FOLDER)
-                .name(FilenameUtils.removeExtension(nodeResource.getName()));
-        ResponseEntity<NodeEntry> responseEntity =
-                nodesApi.createNode(nodeResource.getPrimaryHierarchy().get(0), nodeBodyCreate, true, null, null, null, null);
+    private String createAttachmentsFolder(NodeResource nodeResource, String createdByUser) {
+        // Create folder node in Repository
+        final NodeBodyCreate nodeBodyCreate = new NodeBodyCreate().nodeType(CM_FOLDER).name(FilenameUtils.removeExtension(nodeResource.getName()));
+        ResponseEntity<NodeEntry> responseEntity = nodesApi.createNode(nodeResource.getPrimaryHierarchy().get(0), nodeBodyCreate, true, null, null, null, null);
         String folderId = responseEntity.getBody().getEntry().getId();
+        // Create association with original Message node
         final AssociationBody associationBody = new AssociationBody().assocType(IMAP_ATTACHMENTS_FOLDER).targetId(folderId);
         nodesApi.createAssociation(nodeResource.getId(), associationBody, null);
+        // Set ownership of the folder to the original Message creator
+        final NodeBodyUpdate nodeBodyUpdate = new NodeBodyUpdate().properties(Map.of("cm:owner", createdByUser));
+        nodesApi.updateNode(folderId, nodeBodyUpdate, null, null);
+
         return folderId;
     }
 
-    private List<String> createAttachments(String messageId, String folderId, Message message) throws IOException, MessagingException {
+    private List<String> createAttachments(String messageId, String folderId, Message message, String createdByUser) throws IOException, MessagingException {
         List<String> attachments = new ArrayList<>();
         Multipart multiPart = (Multipart) message.getContent();
         int numberOfParts = multiPart.getCount();
         for (int partCount = 0; partCount < numberOfParts; partCount++) {
             MimeBodyPart part = (MimeBodyPart) multiPart.getBodyPart(partCount);
             if (Part.ATTACHMENT.equalsIgnoreCase(part.getDisposition())) {
+
                 String file = part.getFileName();
 
+                // Create attachment node in Repository
                 final NodeBodyCreate nodeBodyCreate = new NodeBodyCreate().nodeType(CM_CONTENT).name(file);
-                ResponseEntity<NodeEntry> responseEntity =
-                        nodesApi.createNode(folderId, nodeBodyCreate, true, null, null, null, null);
-                nodesApi.updateNodeContent(responseEntity.getBody().getEntry().getId(), IOUtils.toByteArray(part.getInputStream()),
-                        false, null, null, null, null);
+                ResponseEntity<NodeEntry> responseEntity = nodesApi.createNode(folderId, nodeBodyCreate, true, null, null, null, null);
+                nodesApi.updateNodeContent(responseEntity.getBody().getEntry().getId(), IOUtils.toByteArray(part.getInputStream()), false, null, null, null, null);
+                // Create association with original Message node
                 final AssociationBody associationBody = new AssociationBody().assocType(IMAP_ATTACHMENT).targetId(responseEntity.getBody().getEntry().getId());
                 nodesApi.createAssociation(messageId, associationBody, null);
+                // Set ownership of the attachment to the original Message creator
+                final NodeBodyUpdate nodeBodyUpdate = new NodeBodyUpdate().properties(Map.of("cm:owner", createdByUser));
+                nodesApi.updateNode(responseEntity.getBody().getEntry().getId(), nodeBodyUpdate, null, null);
+
                 attachments.add(file);
             }
         }
